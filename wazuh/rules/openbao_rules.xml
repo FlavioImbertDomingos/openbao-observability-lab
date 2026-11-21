@@ -1,0 +1,266 @@
+<!--
+  Wazuh rules for OpenBao audit logs (file audit device, JSON) and server logs.
+  OpenBao writes the same audit format as Vault: a "request" and a "response" line per call.
+  The rules alert on responses so every call is counted once. Level 0 = decoded but not stored.
+  When several child rules match, Wazuh keeps the highest level, so levels are chosen
+  so that the more specific finding wins (policy change by root shows as a policy change).
+  Server (operational) logs are read too: rules 1002xx.
+  Differences from the Vault version of these rules, found against OpenBao 2.7.3 logs:
+  - unseal key rotation (bao operator rotate-keys, sys/rotate/root) and root generation
+    (sys/generate-root-token) need a token now, so they reach the audit log;
+  - audit devices are declared in the server config; an API attempt to change one is
+    refused with a 400 and still audited (rule 100141);
+  - namespaces are part of the open-source core, so namespace changes get a rule (100144);
+  - standbys serve reads and write their own audit lines, so collect from every node;
+  - a write sent to a standby is audited twice: a failed local try, then the forwarded call
+    (rule 100102 keeps the first one quiet, and 100110 ignores it).
+-->
+<group name="openbao,">
+
+  <!-- base: any OpenBao audit line -->
+  <rule id="100100" level="0">
+    <decoded_as>json</decoded_as>
+    <field name="type" type="pcre2">^(request|response)$</field>
+    <field name="request.path" type="pcre2">.</field>
+    <description>OpenBao audit event</description>
+  </rule>
+
+  <rule id="100101" level="0">
+    <if_sid>100100</if_sid>
+    <field name="type">^response$</field>
+    <description>OpenBao: $(request.operation) $(request.path)</description>
+  </rule>
+
+  <!-- authentication -->
+  <rule id="100110" level="5">
+    <if_sid>100101</if_sid>
+    <field name="request.path" type="pcre2">^auth/.+/login</field>
+    <!-- not the standby's first try: a login sent to a read-enabled standby is run locally,
+         hits read-only storage, is audited with this error, then forwarded and succeeds -->
+    <field name="error" type="pcre2">^(?!(1 error occurred:\s+\* )?invalid request\s*$)(?!.*readonly storage).+</field>
+    <description>OpenBao: failed login on $(request.path) from $(request.remote_address)</description>
+    <mitre><id>T1110</id></mitre>
+    <group>authentication_failed,pci_dss_10.2.4,pci_dss_10.2.5,</group>
+  </rule>
+
+  <rule id="100111" level="10" frequency="6" timeframe="120">
+    <if_matched_sid>100110</if_matched_sid>
+    <same_field>request.path</same_field>
+    <description>OpenBao: possible brute force, 6+ failed logins on $(request.path) in 2 minutes</description>
+    <mitre><id>T1110</id></mitre>
+    <group>authentication_failures,pci_dss_11.4,pci_dss_10.2.4,</group>
+  </rule>
+
+  <!-- Lockout. OpenBao 2.7 writes no server log line when a user is locked out (Vault 1.19 did),
+       and vault_core_locked_users stayed at 0 in the lab. The audit log shows it: once locked,
+       a login answers "permission denied" instead of "invalid credentials". -->
+  <rule id="100114" level="10">
+    <if_sid>100110</if_sid>
+    <field name="error" type="pcre2">permission denied</field>
+    <description>OpenBao: login refused for a locked-out user on $(request.path) from $(request.remote_address)</description>
+    <mitre><id>T1110</id></mitre>
+    <group>authentication_failures,pci_dss_10.2.4,</group>
+  </rule>
+
+  <!-- OIDC/JWT: a failed callback has no top-level "error"; the reason is in
+       response.data.error, HMAC-hashed like every other response value -->
+  <rule id="100112" level="5">
+    <if_sid>100101</if_sid>
+    <field name="request.path" type="pcre2">^auth/.+/oidc/callback$</field>
+    <field name="response.data.error" type="pcre2">.</field>
+    <description>OpenBao: failed OIDC login on $(request.path) from $(request.remote_address)</description>
+    <mitre><id>T1110</id></mitre>
+    <group>authentication_failed,pci_dss_10.2.4,pci_dss_10.2.5,</group>
+  </rule>
+
+  <rule id="100113" level="10" frequency="6" timeframe="120">
+    <if_matched_sid>100112</if_matched_sid>
+    <same_field>request.path</same_field>
+    <description>OpenBao: 6+ failed OIDC logins on $(request.path) in 2 minutes</description>
+    <mitre><id>T1110</id></mitre>
+    <group>authentication_failures,pci_dss_11.4,pci_dss_10.2.4,</group>
+  </rule>
+
+  <!-- Standby write attempts. Since 2.5 a standby runs every request itself and forwards it to
+       the active node only when it tries to write. The failed local try is audited (error
+       "invalid request" or "cannot write to readonly storage"), followed by a second
+       request/response pair with the real result. Kept at level 0 so nobody gets paged. -->
+  <rule id="100102" level="0">
+    <if_sid>100101</if_sid>
+    <field name="error" type="pcre2">^(1 error occurred:\s+\* )?invalid request\s*$|readonly storage</field>
+    <description>OpenBao: standby forwarded a write ($(request.operation) $(request.path))</description>
+    <group>openbao_forward,</group>
+  </rule>
+
+  <!-- authorization -->
+  <rule id="100120" level="5">
+    <if_sid>100101</if_sid>
+    <field name="error" type="pcre2">permission denied</field>
+    <field name="request.path" type="pcre2">^(?!auth/.+/login)</field>
+    <description>OpenBao: permission denied for $(auth.display_name) on $(request.path)</description>
+    <group>access_denied,pci_dss_10.2.4,</group>
+  </rule>
+
+  <rule id="100121" level="9" frequency="5" timeframe="60">
+    <if_matched_sid>100120</if_matched_sid>
+    <same_field>auth.display_name</same_field>
+    <description>OpenBao: $(auth.display_name) denied 5+ times in 1 minute (probing)</description>
+    <mitre><id>T1083</id></mitre>
+    <group>access_denied,</group>
+  </rule>
+
+  <!-- needs: bao write sys/quotas/config enable_rate_limit_audit_logging=true
+       (rejected requests only produce a "request" line, so this hangs off 100100) -->
+  <rule id="100125" level="6">
+    <if_sid>100100</if_sid>
+    <field name="error" type="pcre2">(?i)rate limit quota exceeded</field>
+    <description>OpenBao: rate limit quota exceeded on $(request.path)</description>
+    <group>openbao_quota,</group>
+  </rule>
+
+  <!-- privileged and configuration endpoints -->
+  <rule id="100140" level="10">
+    <if_sid>100101</if_sid>
+    <field name="request.path" type="pcre2">^sys/(generate-root|generate-root-token|rekey|rekey-recovery-key|rotate|seal|step-down|raw)</field>
+    <description>OpenBao: privileged endpoint $(request.operation) $(request.path) from $(request.remote_address) $(auth.display_name)</description>
+    <mitre><id>T1098</id></mitre>
+    <group>openbao_privileged,pci_dss_10.2.2,</group>
+  </rule>
+
+  <rule id="100141" level="12">
+    <if_sid>100101</if_sid>
+    <field name="request.path" type="pcre2">^sys/audit/</field>
+    <field name="request.operation" type="pcre2">^(update|create|delete)$</field>
+    <!-- fires on refused attempts too: in OpenBao 2.x audit devices live in the config file -->
+    <description>OpenBao: audit device change attempted ($(request.operation) $(request.path)) by $(auth.display_name)</description>
+    <mitre><id>T1562.008</id></mitre>
+    <group>openbao_privileged,pci_dss_10.5.2,</group>
+  </rule>
+
+  <rule id="100142" level="9">
+    <if_sid>100101</if_sid>
+    <field name="request.path" type="pcre2">^sys/(policy|policies/acl)/</field>
+    <field name="request.operation" type="pcre2">^(update|create|delete)$</field>
+    <description>OpenBao: policy changed ($(request.operation) $(request.path)) by $(auth.display_name)</description>
+    <mitre><id>T1098</id></mitre>
+    <group>openbao_config,pci_dss_10.2.7,</group>
+  </rule>
+
+  <rule id="100143" level="9">
+    <if_sid>100101</if_sid>
+    <field name="request.path" type="pcre2">^sys/(auth|mounts)/</field>
+    <field name="request.operation" type="pcre2">^(update|create|delete)$</field>
+    <description>OpenBao: auth method or secrets engine changed ($(request.operation) $(request.path))</description>
+    <group>openbao_config,</group>
+  </rule>
+
+  <rule id="100144" level="9">
+    <if_sid>100101</if_sid>
+    <field name="request.path" type="pcre2">^sys/namespaces/</field>
+    <field name="request.operation" type="pcre2">^(update|create|delete|patch)$</field>
+    <description>OpenBao: namespace changed ($(request.operation) $(request.path)) by $(auth.display_name)</description>
+    <mitre><id>T1098</id></mitre>
+    <group>openbao_config,</group>
+  </rule>
+
+  <!-- root token: listed last so the privileged rules above win when both match -->
+  <rule id="100131" level="12">
+    <if_sid>100101</if_sid>
+    <field name="response.auth.policies" type="pcre2">\broot\b</field>
+    <description>OpenBao: a new root token was issued via $(request.path)</description>
+    <mitre><id>T1078</id></mitre>
+    <group>openbao_root,pci_dss_10.2.2,</group>
+  </rule>
+
+  <rule id="100130" level="8">
+    <if_sid>100101</if_sid>
+    <field name="auth.policies" type="pcre2">\broot\b</field>
+    <!-- skip the CLI's own preflight lookups -->
+    <field name="request.path" type="pcre2">^(?!sys/internal/ui/mounts)</field>
+    <description>OpenBao: root token used for $(request.operation) $(request.path)</description>
+    <mitre><id>T1078</id></mitre>
+    <group>openbao_root,pci_dss_10.2.2,</group>
+  </rule>
+
+</group>
+
+<group name="openbao,openbao_server,">
+
+  <rule id="100200" level="0">
+    <decoded_as>json</decoded_as>
+    <field name="@module" type="pcre2">.</field>
+    <field name="@message" type="pcre2">.</field>
+    <description>OpenBao server log</description>
+  </rule>
+
+  <rule id="100201" level="5">
+    <if_sid>100200</if_sid>
+    <field name="@level">^error$</field>
+    <!-- join retries before the cluster is initialized are expected noise -->
+    <field name="@message" type="pcre2">^(?!failed to get raft challenge|failed to retry join raft cluster)</field>
+    <description>OpenBao server error: $(@message)</description>
+  </rule>
+
+  <!-- A read-enabled standby logs ERROR lines such as "failed to persist failed login user entry"
+       or "set namespace failed" when a request it ran locally tried to write. The request is then
+       forwarded and succeeds, so these are not failures. -->
+  <rule id="100209" level="0">
+    <if_sid>100201</if_sid>
+    <field name="error" type="pcre2">readonly storage</field>
+    <description>OpenBao server: standby write attempt, request forwarded ($(@message))</description>
+    <group>openbao_forward,</group>
+  </rule>
+
+  <rule id="100202" level="10">
+    <if_sid>100200</if_sid>
+    <field name="@message" type="pcre2">^(rekey initialized|rotation initialized|root generation initialized|rekey canceled|rotation canceled|root generation canceled|root token generated)</field>
+    <description>OpenBao server: $(@message) (unseal/root key ceremony)</description>
+    <mitre><id>T1098</id></mitre>
+    <group>openbao_privileged,</group>
+  </rule>
+
+  <rule id="100203" level="10">
+    <if_sid>100200</if_sid>
+    <field name="@message" type="pcre2">^vault is sealed</field>
+    <description>OpenBao server: a node was sealed</description>
+    <group>openbao_availability,</group>
+  </rule>
+
+  <rule id="100204" level="6">
+    <if_sid>100200</if_sid>
+    <field name="@message" type="pcre2">^acquired lock, enabling active operation</field>
+    <description>OpenBao server: a node became the active node</description>
+    <group>openbao_availability,</group>
+  </rule>
+
+  <rule id="100207" level="10">
+    <if_sid>100200</if_sid>
+    <field name="@message" type="pcre2">^login attempts exceeded, user is locked out</field>
+    <description>OpenBao server: user locked out after repeated failed logins</description>
+    <mitre><id>T1110</id></mitre>
+    <group>authentication_failures,</group>
+  </rule>
+
+  <!-- sys/step-down only writes a request line to the audit log, so watch the server log -->
+  <rule id="100208" level="7">
+    <if_sid>100200</if_sid>
+    <field name="@message" type="pcre2">^stepping down from active operation</field>
+    <description>OpenBao server: the active node stepped down</description>
+    <group>openbao_availability,</group>
+  </rule>
+
+  <rule id="100206" level="7">
+    <if_sid>100200</if_sid>
+    <field name="@message" type="pcre2">^heartbeat timeout reached, starting election</field>
+    <description>OpenBao server: Raft leader lost, election started</description>
+    <group>openbao_availability,</group>
+  </rule>
+
+  <rule id="100205" level="3">
+    <if_sid>100200</if_sid>
+    <field name="@message" type="pcre2">^(vault is unsealed|entering (read-enabled )?standby mode)</field>
+    <description>OpenBao server: $(@message)</description>
+    <group>openbao_availability,</group>
+  </rule>
+
+</group>

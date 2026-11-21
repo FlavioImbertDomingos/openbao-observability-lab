@@ -1,0 +1,38 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # Every OpenBao node is scraped directly (not through a load balancer) so standbys show up too.
+  # Works without a token because the listener sets unauthenticated_metrics_access = true.
+  # In production you would drop that and use: authorization: { credentials_file: /path/to/token }
+  # OpenBao keeps Vault's metric names (vault_*), so existing Vault dashboards and alerts carry over.
+  - job_name: openbao
+    metrics_path: /v1/sys/metrics
+    params:
+      format: [prometheus]
+    static_configs:
+      - targets: ["bao-1:8200", "bao-2:8200", "bao-3:8200"]
+        labels: { cluster: raft }
+    # PostgreSQL cluster: lab.sh writes targets/openbao-pg.json and postgres-pg.json on "pg up" and empties it on "pg down"
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/openbao-*.json"]
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "([^:]+):.*"
+        target_label: node
+
+  - job_name: postgres
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/postgres-*.json"]
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "pg-exporter-(.):.*"
+        target_label: site
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

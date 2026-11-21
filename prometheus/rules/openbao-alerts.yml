@@ -1,0 +1,113 @@
+# Alert rules for OpenBao, adapted from HashiCorp Validated Designs, "Monitoring and observability".
+# OpenBao exports the same metric names as Vault (vault_*), so the expressions are unchanged.
+# View them at http://localhost:9090/alerts
+groups:
+  - name: openbao
+    rules:
+      - alert: OpenBaoNodeSealed
+        expr: vault_core_unsealed == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.node }} ({{ $labels.cluster }}) is sealed"
+
+      - alert: OpenBaoNodeDown
+        expr: up{job="openbao"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }} is not answering /v1/sys/metrics"
+
+      - alert: OpenBaoNoActiveNode
+        expr: sum by (cluster) (vault_core_active) < 1
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "No active OpenBao node in {{ $labels.cluster }}"
+
+      - alert: OpenBaoLeadershipLost
+        expr: increase(vault_core_leadership_lost_count[10m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} lost leadership in the last 10 minutes"
+
+      - alert: OpenBaoRaftFailureToleranceZero
+        expr: max by (cluster) (vault_autopilot_failure_tolerance) < 1
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.cluster }} cannot lose another voter without losing quorum"
+
+      - alert: OpenBaoAuditFailure
+        expr: increase(vault_audit_log_request_failure[5m]) > 0 or increase(vault_audit_log_response_failure[5m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Audit device failures on {{ $labels.node }}. If all devices fail, OpenBao stops serving requests"
+
+      - alert: OpenBaoRootTokenCreated
+        expr: increase(vault_token_create_root[5m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "A root token was created"
+
+      - alert: OpenBaoRequestLatencyHigh
+        expr: vault_core_handle_request{quantile="0.99"} > 500
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "p99 request latency on {{ $labels.node }} above 500 ms"
+
+      - alert: OpenBaoGCPauseHigh
+        expr: rate(vault_runtime_total_gc_pause_ns[2m]) * 60 / 1e9 > 2
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "GC pause on {{ $labels.node }} above 2 s per minute"
+
+      - alert: OpenBaoLeaseCountHigh
+        expr: sum by (cluster) (vault_expire_num_leases) > 250000
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than 250k active leases in {{ $labels.cluster }}"
+
+      - alert: OpenBaoRateLimitViolations
+        expr: sum by (cluster) (increase(vault_quota_rate_limit_violation[5m])) > 0
+        labels: { severity: info }
+        annotations:
+          summary: "Clients hit a rate limit quota (HTTP 429). Quotas are counted per node, standbys included"
+
+  - name: openbao-dr
+    rules:
+      # pg_up and pg_replication_lag_seconds come from postgres-exporter (./lab.sh pg up)
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "PostgreSQL in site {{ $labels.site }} is down"
+
+      - alert: PostgresReplicaLagHigh
+        expr: (pg_replication_lag_seconds > 30) and on(site) (pg_replication_is_replica == 1)
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Site {{ $labels.site }} replica is {{ $value | humanizeDuration }} behind: that much data would be lost in a failover"
+
+      # During a link cut the primary drops the replica from pg_stat_replication, and the replica
+      # itself cannot be scraped, so lag metrics go silent instead of rising. The replication slot
+      # on the primary is what still tells the truth. It turns inactive only after wal_sender_timeout
+      # (60 s by default, 10 s in this lab), so keep that timeout short.
+      - alert: PostgresReplicaDisconnected
+        expr: pg_replication_slots_slot_is_active{slot_name="site_b"} == 0
+        for: 15s
+        labels: { severity: critical }
+        annotations:
+          summary: "Site B is not receiving WAL: every OpenBao write from now on exists only in site A"
+
+      - alert: PostgresReplicaBehindBytes
+        expr: pg_replication_slots_pg_wal_lsn_diff{slot_name="site_b"} > 16 * 1024 * 1024
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Site B is {{ $value | humanize1024 }}B of WAL behind"

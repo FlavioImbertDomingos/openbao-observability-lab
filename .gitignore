@@ -1,0 +1,9 @@
+secrets/*
+!secrets/.gitkeep
+wazuh/config/wazuh_indexer_ssl_certs/
+backups/*
+!backups/.gitkeep
+.env
+.env.tmp
+prometheus/targets/*.json
+.DS_Store
